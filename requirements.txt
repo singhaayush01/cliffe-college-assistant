@@ -1,0 +1,16 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+pydantic
+requests
+beautifulsoup4
+
+langchain
+langchain-core
+langchain-text-splitters
+langchain-google-genai
+langchain-huggingface
+langchain-pinecone
+pinecone
+sentence-transformers
+google-genai
