@@ -2,7 +2,8 @@
 
 A RAG (Retrieval-Augmented Generation) chatbot for **Cliffe College of Creative Arts** at Youngstown State University. Ask it about programs, faculty, leadership, events, or anything else published on the Cliffe College site, and it answers using content scraped directly from `academics.ysu.edu`.
 
-> **Status:** Running locally for development. Live deployment is coming soon — this README will be updated with a public URL once it's hosted.
+> **Status:** Running locally for development. Previous deployment is erased. 
+Live deployment is coming soon — this README will be updated with a public URL once it's hosted.
 
 
 [Cliffe AI demo](./live-demo.png)
