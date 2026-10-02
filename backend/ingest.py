@@ -143,10 +143,7 @@ def chunk_documents(documents):
 
         for section in sections:
             section.metadata["source"] = doc.metadata.get("source")
-            if len(section.page_content) > 1200:
-                final_chunks.extend(size_splitter.split_documents([section]))
-            else:
-                final_chunks.append(section)
+            final_chunks.extend(size_splitter.split_documents([section]))
 
     return final_chunks
 

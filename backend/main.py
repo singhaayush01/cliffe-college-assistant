@@ -1,4 +1,5 @@
 import os
+import time
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -87,20 +88,70 @@ def health():
 
 @app.post("/ask")
 def ask(q: Query):
+    start_time = time.time()
+
     print(f"📝 Question: {q.question}")
+
     try:
+        print("⏳ Starting RAG chain...")
+
         response = chain.invoke({"input": q.question})
-        return {"answer": response["answer"]}
+
+        elapsed = time.time() - start_time
+        print(f"✅ RAG completed in {elapsed:.2f} seconds")
+
+        return {
+            "answer": response["answer"],
+            "response_time": round(elapsed, 2)
+        }
+
     except Exception as e:
-        print(f"❌ API ERROR: {e}")
-        docs = retriever.invoke(q.question)
-        if docs:
-            fallback = "⚠️ AI is busy, here are relevant pages:\n\n"
-            seen = set()
-            for doc in docs[:3]:
-                src = doc.metadata.get('source', 'Unknown')
-                if src not in seen:
-                    fallback += f"🔗 {src}\n"
-                    seen.add(src)
-            return {"answer": fallback}
-        return {"answer": "System Error. Please try again."}
+        chain_elapsed = time.time() - start_time
+
+        print(f"❌ RAG failed after {chain_elapsed:.2f} seconds")
+        print(f"❌ API ERROR: {type(e).__name__}: {e}")
+
+        # Time the fallback retrieval separately
+        fallback_start = time.time()
+
+        try:
+            print("⏳ Starting fallback retrieval...")
+
+            docs = retriever.invoke(q.question)
+
+            fallback_elapsed = time.time() - fallback_start
+            total_elapsed = time.time() - start_time
+
+            print(
+                f"⚠️ Fallback retrieval completed in "
+                f"{fallback_elapsed:.2f} seconds"
+            )
+
+            if docs:
+                fallback = "⚠️ AI is busy, here are relevant pages:\n\n"
+                seen = set()
+
+                for doc in docs[:3]:
+                    src = doc.metadata.get("source", "Unknown")
+
+                    if src not in seen:
+                        fallback += f"🔗 {src}\n"
+                        seen.add(src)
+
+                return {
+                    "answer": fallback,
+                    "response_time": round(total_elapsed, 2)
+                }
+
+        except Exception as fallback_error:
+            print(
+                f"❌ FALLBACK ERROR: "
+                f"{type(fallback_error).__name__}: {fallback_error}"
+            )
+
+        total_elapsed = time.time() - start_time
+
+        return {
+            "answer": "System Error. Please try again.",
+            "response_time": round(total_elapsed, 2)
+        }
