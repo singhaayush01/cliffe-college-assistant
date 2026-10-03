@@ -1,6 +1,5 @@
 import os
 import time
-from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -8,16 +7,20 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Global state - initialized on startup AFTER port is bound
+# RAG objects are created only when first needed.
 chain = None
 retriever = None
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    """Runs after uvicorn binds the port — Render can detect it immediately."""
+
+def initialize_rag():
     global chain, retriever
 
+    # Don't initialize twice.
+    if chain is not None and retriever is not None:
+        return
+
     print("🧠 Initializing Cliffe AI...")
+    start = time.time()
 
     from langchain_google_genai import ChatGoogleGenerativeAI
     from langchain_huggingface import HuggingFaceEndpointEmbeddings
@@ -35,7 +38,10 @@ async def lifespan(app: FastAPI):
         index_name="cliffe-bot",
         embedding=embeddings
     )
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 20})
+
+    retriever = vectorstore.as_retriever(
+        search_kwargs={"k": 20}
+    )
 
     llm = ChatGoogleGenerativeAI(
         model="gemini-2.5-flash",
@@ -47,7 +53,8 @@ async def lifespan(app: FastAPI):
         "You are a helpful assistant for Cliffe College at YSU. "
         "Use the context below to answer the student's question accurately. "
         "If the answer includes a person's name, include their title. "
-        "If you cannot find the answer, say 'I cannot find that info on the Cliffe website'. "
+        "If you cannot find the answer, say "
+        "'I cannot find that info on the Cliffe website'. "
         "\n\n"
         "{context}"
     )
@@ -62,12 +69,12 @@ async def lifespan(app: FastAPI):
         create_stuff_documents_chain(llm, prompt)
     )
 
-    print("✅ Cliffe AI ready!")
-    yield
-    print("🛑 Shutting down.")
+    elapsed = time.time() - start
+    print(f"✅ Cliffe AI ready in {elapsed:.2f} seconds!")
 
 
-app = FastAPI(lifespan=lifespan)
+# FastAPI starts without waiting for RAG initialization.
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -83,73 +90,96 @@ class Query(BaseModel):
 
 @app.get("/")
 def health():
-    return {"status": "ok", "service": "Cliffe AI"}
+    return {
+        "status": "ok",
+        "service": "Cliffe AI",
+        "rag_ready": chain is not None
+    }
 
 
 @app.post("/ask")
 def ask(q: Query):
-    start_time = time.time()
+    global chain, retriever
+
+    request_start = time.time()
 
     print(f"📝 Question: {q.question}")
 
     try:
+        # Initialize RAG only when it is actually needed.
+        if chain is None:
+            print("⚙️ RAG not initialized. Initializing now...")
+            initialize_rag()
+
+        rag_start = time.time()
+
         print("⏳ Starting RAG chain...")
 
-        response = chain.invoke({"input": q.question})
+        response = chain.invoke({
+            "input": q.question
+        })
 
-        elapsed = time.time() - start_time
-        print(f"✅ RAG completed in {elapsed:.2f} seconds")
+        rag_elapsed = time.time() - rag_start
+        total_elapsed = time.time() - request_start
+
+        print(f"✅ RAG completed in {rag_elapsed:.2f} seconds")
+        print(f"⏱️ Total request time: {total_elapsed:.2f} seconds")
 
         return {
             "answer": response["answer"],
-            "response_time": round(elapsed, 2)
+            "response_time": round(total_elapsed, 2)
         }
 
     except Exception as e:
-        chain_elapsed = time.time() - start_time
+        chain_elapsed = time.time() - request_start
 
         print(f"❌ RAG failed after {chain_elapsed:.2f} seconds")
         print(f"❌ API ERROR: {type(e).__name__}: {e}")
 
-        # Time the fallback retrieval separately
-        fallback_start = time.time()
+        # Only attempt fallback if the retriever was initialized.
+        if retriever is not None:
+            fallback_start = time.time()
 
-        try:
-            print("⏳ Starting fallback retrieval...")
+            try:
+                print("⏳ Starting fallback retrieval...")
 
-            docs = retriever.invoke(q.question)
+                docs = retriever.invoke(q.question)
 
-            fallback_elapsed = time.time() - fallback_start
-            total_elapsed = time.time() - start_time
+                fallback_elapsed = time.time() - fallback_start
+                total_elapsed = time.time() - request_start
 
-            print(
-                f"⚠️ Fallback retrieval completed in "
-                f"{fallback_elapsed:.2f} seconds"
-            )
+                print(
+                    f"⚠️ Fallback retrieval completed in "
+                    f"{fallback_elapsed:.2f} seconds"
+                )
 
-            if docs:
-                fallback = "⚠️ AI is busy, here are relevant pages:\n\n"
-                seen = set()
+                if docs:
+                    fallback = (
+                        "⚠️ AI is busy, here are relevant pages:\n\n"
+                    )
 
-                for doc in docs[:3]:
-                    src = doc.metadata.get("source", "Unknown")
+                    seen = set()
 
-                    if src not in seen:
-                        fallback += f"🔗 {src}\n"
-                        seen.add(src)
+                    for doc in docs[:3]:
+                        src = doc.metadata.get("source", "Unknown")
 
-                return {
-                    "answer": fallback,
-                    "response_time": round(total_elapsed, 2)
-                }
+                        if src not in seen:
+                            fallback += f"🔗 {src}\n"
+                            seen.add(src)
 
-        except Exception as fallback_error:
-            print(
-                f"❌ FALLBACK ERROR: "
-                f"{type(fallback_error).__name__}: {fallback_error}"
-            )
+                    return {
+                        "answer": fallback,
+                        "response_time": round(total_elapsed, 2)
+                    }
 
-        total_elapsed = time.time() - start_time
+            except Exception as fallback_error:
+                print(
+                    f"❌ FALLBACK ERROR: "
+                    f"{type(fallback_error).__name__}: "
+                    f"{fallback_error}"
+                )
+
+        total_elapsed = time.time() - request_start
 
         return {
             "answer": "System Error. Please try again.",
