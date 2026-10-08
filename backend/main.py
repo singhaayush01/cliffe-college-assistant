@@ -5,11 +5,12 @@ import re
 import threading
 import time
 from pathlib import Path
+from typing import Literal
 
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 load_dotenv()
 
@@ -32,6 +33,24 @@ STOP_WORDS = {
     "why", "with", "you", "your",
 }
 
+FOLLOW_UP_WORDS = {
+    "he", "she", "him", "her", "his", "hers", "they", "them", "their",
+    "it", "its", "this", "that", "these", "those", "there", "again",
+    "email", "phone", "contact", "address", "more",
+}
+
+FOLLOW_UP_PHRASES = (
+    "what about",
+    "how about",
+    "tell me more",
+    "have a look",
+    "look again",
+    "can i have",
+    "do they",
+    "does she",
+    "does he",
+)
+
 pc = None
 index = None
 gemini_client = None
@@ -39,6 +58,16 @@ bm25 = None
 corpus_rows = None
 row_by_id = None
 initialize_lock = threading.Lock()
+
+
+class ConversationMessage(BaseModel):
+    role: Literal["user", "assistant"]
+    content: str
+
+
+class Query(BaseModel):
+    question: str
+    history: list[ConversationMessage] = Field(default_factory=list)
 
 
 def normalize_token(token: str) -> str:
@@ -69,6 +98,59 @@ def significant_query_tokens(question: str) -> list[str]:
     ]
 
 
+def is_follow_up(question: str) -> bool:
+    lowered = question.lower().strip()
+    tokens = set(tokenize(question))
+
+    if any(word in tokens for word in FOLLOW_UP_WORDS):
+        return True
+
+    return any(phrase in lowered for phrase in FOLLOW_UP_PHRASES)
+
+
+def build_retrieval_query(
+    question: str,
+    history: list[ConversationMessage],
+) -> str:
+    """
+    Resolve short conversational follow-ups without making another LLM call.
+
+    Example:
+      "Who is Samantha Nan-Callahan?"
+      "Can I have her email?"
+
+    The second retrieval query includes recent useful conversation text, so
+    Pinecone/BM25 still see "Samantha Nan-Callahan".
+    """
+    if not history or not is_follow_up(question):
+        return question
+
+    useful_messages = []
+
+    for message in history[-6:]:
+        content = message.content.strip()
+
+        if not content:
+            continue
+
+        # A previous fallback/error should not become retrieval evidence.
+        lowered = content.lower()
+
+        if message.role == "assistant" and (
+            lowered.startswith("i cannot find that info")
+            or lowered.startswith("system error")
+            or lowered.startswith("⚠️")
+        ):
+            continue
+
+        useful_messages.append(content)
+
+    if not useful_messages:
+        return question
+
+    return " ".join(useful_messages + [question])
+
+
 def embedding_values(item):
     if hasattr(item, "values"):
         return list(item.values)
@@ -81,6 +163,36 @@ def embedding_values(item):
     )
 
 
+
+def clean_answer_text(text: str) -> str:
+    """
+    Keep chatbot answers clean in the current frontend, which displays plain
+    text rather than rendering Markdown.
+    """
+    if not text:
+        return "I cannot find that info on the Cliffe website."
+
+    cleaned = text.strip()
+
+    # Remove common Markdown formatting characters while preserving content.
+    cleaned = re.sub(r"\*\*(.*?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__(.*?)__", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\*)\*(?!\*)(.*?)\*(?!\*)", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!_)_(?!_)(.*?)_(?!_)", r"\1", cleaned)
+    cleaned = cleaned.replace("`", "")
+
+    # Convert Markdown bullet markers to simple readable lines.
+    cleaned = re.sub(r"(?m)^\s*[\*\-]\s+", "• ", cleaned)
+
+    # Remove Markdown heading markers.
+    cleaned = re.sub(r"(?m)^\s*#{1,6}\s*", "", cleaned)
+
+    # Avoid excessive blank lines.
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+
+    return cleaned.strip()
+
+
 def initialize_rag():
     global pc, index, gemini_client, bm25, corpus_rows, row_by_id
 
@@ -91,7 +203,7 @@ def initialize_rag():
         if index is not None and gemini_client is not None and bm25 is not None:
             return
 
-        print("🧠 Initializing Cliffe AI V3 free hybrid RAG...")
+        print("🧠 Initializing Cliffe AI V3.1 conversational hybrid RAG...")
         start = time.time()
 
         pinecone_key = os.getenv("PINECONE_API_KEY")
@@ -140,7 +252,7 @@ def initialize_rag():
             f"   Loaded {len(corpus_rows)} chunks for BM25."
         )
         print(
-            f"✅ Cliffe AI V3 ready in "
+            f"✅ Cliffe AI V3.1 ready in "
             f"{time.time() - start:.2f}s"
         )
 
@@ -364,13 +476,30 @@ def build_context(docs: list[dict]) -> str:
     return "\n\n---\n\n".join(blocks)
 
 
+def build_history_for_prompt(
+    history: list[ConversationMessage],
+) -> str:
+    if not history:
+        return "(No previous conversation.)"
+
+    lines = []
+
+    for message in history[-6:]:
+        label = "Student" if message.role == "user" else "Cliffe AI"
+        lines.append(f"{label}: {message.content}")
+
+    return "\n".join(lines)
+
+
 def answer_with_gemini(
     question: str,
     docs: list[dict],
+    history: list[ConversationMessage],
 ) -> str:
     from google.genai import types
 
     context = build_context(docs)
+    conversation = build_history_for_prompt(history)
 
     prompt = f"""You are Cliffe AI, a student assistant for Youngstown State University's Cliffe College of Creative Arts.
 
@@ -378,15 +507,24 @@ Answer ONLY from the provided Cliffe website context.
 
 Rules:
 - Give the direct answer first.
-- Be accurate and concise.
+- Be accurate, concise, and natural.
+- Write plain text only. Do NOT use Markdown formatting such as *, **, _, #, backticks, or Markdown tables.
+- Prefer short paragraphs. If a list is genuinely useful, use simple "•" bullets only.
+- Do not dump unrelated retrieved context. Answer only what the student actually asked.
+- Use recent conversation only to understand references such as "her", "him", "it", "that", or "there".
+- Previous assistant answers are NOT evidence. Verify every factual claim against the current Cliffe website context.
 - When asked about a person, include their title or role when available.
+- If the user asks for contact information and it appears in the context, provide it directly.
 - For broad questions such as scholarships, summarize relevant options across the retrieved Cliffe units instead of mentioning only one page.
 - Never invent facts.
 - Do not use outside knowledge.
 - If the context is insufficient, say exactly: "I cannot find that info on the Cliffe website."
 - Do not mention embeddings, Pinecone, BM25, chunks, RRF, or internal retrieval systems.
 
-Question:
+Recent conversation:
+{conversation}
+
+Current question:
 {question}
 
 Cliffe website context:
@@ -401,7 +539,7 @@ Cliffe website context:
         ),
     )
 
-    return (
+    return clean_answer_text(
         response.text
         or "I cannot find that info on the Cliffe website."
     )
@@ -437,16 +575,12 @@ app.add_middleware(
 )
 
 
-class Query(BaseModel):
-    question: str
-
-
 @app.get("/")
 def health():
     return {
         "status": "ok",
         "service": "Cliffe AI",
-        "rag_version": "v3-free-hybrid",
+        "rag_version": "v3.1-conversational-hybrid",
         "index": INDEX_NAME,
         "namespace": NAMESPACE,
         "embedding_model": EMBED_MODEL,
@@ -461,6 +595,7 @@ def health():
 def ask(q: Query):
     request_start = time.time()
     question = q.question.strip()
+    history = q.history[-6:]
 
     if not question:
         return {
@@ -477,8 +612,16 @@ def ask(q: Query):
         initialize_rag()
         init_elapsed = time.time() - init_start
 
+        retrieval_query = build_retrieval_query(
+            question,
+            history,
+        )
+
+        if retrieval_query != question:
+            print(f"💬 Contextual retrieval: {retrieval_query[:300]}")
+
         retrieval_start = time.time()
-        docs, dense, lexical = hybrid_search(question)
+        docs, dense, lexical = hybrid_search(retrieval_query)
         retrieval_elapsed = time.time() - retrieval_start
 
         print(
@@ -504,6 +647,7 @@ def ask(q: Query):
         answer = answer_with_gemini(
             question,
             docs,
+            history,
         )
         generation_elapsed = (
             time.time() - generation_start

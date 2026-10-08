@@ -17,7 +17,24 @@ type Message = {
   role: 'user' | 'assistant';
   content: string;
   responseTime?: number;
+  sources?: string[];
 };
+
+function sourceLabel(source: string) {
+  try {
+    const url = new URL(source);
+    const path = url.pathname.replace(/\/$/, '');
+
+    if (!path) return url.hostname;
+
+    const parts = path.split('/').filter(Boolean);
+    return parts[parts.length - 1]
+      .replace(/-/g, ' ')
+      .replace(/\b\w/g, (letter) => letter.toUpperCase());
+  } catch {
+    return 'Official YSU source';
+  }
+}
 
 export default function Home() {
   const [question, setQuestion] = useState('');
@@ -26,7 +43,6 @@ export default function Home() {
 
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Automatically scroll to newest message.
   useEffect(() => {
     bottomRef.current?.scrollIntoView({
       behavior: 'smooth',
@@ -38,7 +54,13 @@ export default function Home() {
 
     if (!trimmedQuestion || loading) return;
 
-    // Add the user's message to conversation.
+    // Send only the latest few messages as conversation context.
+    // The current question is sent separately below.
+    const history = messages.slice(-6).map((message) => ({
+      role: message.role,
+      content: message.content,
+    }));
+
     setMessages((previous) => [
       ...previous,
       {
@@ -47,7 +69,6 @@ export default function Home() {
       },
     ]);
 
-    // Clear input immediately.
     setQuestion('');
     setLoading(true);
 
@@ -56,21 +77,22 @@ export default function Home() {
         `${API_URL}/ask`,
         {
           question: trimmedQuestion,
+          history,
         },
         {
-          // Your Render cold start can take around 49 seconds,
-          // so give the request enough time.
           timeout: 120000,
         }
       );
 
-      // Add AI response without deleting previous messages.
       setMessages((previous) => [
         ...previous,
         {
           role: 'assistant',
           content: res.data.answer,
           responseTime: res.data.response_time,
+          sources: Array.isArray(res.data.sources)
+            ? res.data.sources
+            : [],
         },
       ]);
     } catch (error) {
@@ -128,7 +150,6 @@ export default function Home() {
         padding: '20px',
       }}
     >
-      {/* MAIN CHAT CARD */}
       <div
         style={{
           width: '100%',
@@ -146,7 +167,6 @@ export default function Home() {
           flexDirection: 'column',
         }}
       >
-        {/* HEADER */}
         <div
           style={{
             backgroundColor: '#c8102e',
@@ -209,7 +229,6 @@ export default function Home() {
           </button>
         </div>
 
-        {/* CONVERSATION AREA */}
         <div
           style={{
             flex: 1,
@@ -314,23 +333,18 @@ export default function Home() {
                       borderRadius: isUser
                         ? '18px 18px 4px 18px'
                         : '18px 18px 18px 4px',
-
                       backgroundColor: isUser
                         ? '#c8102e'
                         : 'white',
-
                       color: isUser
                         ? 'white'
                         : '#333',
-
                       border: isUser
                         ? 'none'
                         : '1px solid #e5e5e5',
-
                       boxShadow: isUser
                         ? 'none'
                         : '0 3px 10px rgba(0,0,0,0.04)',
-
                       lineHeight: '1.65',
                       fontSize: '16px',
                       whiteSpace: 'pre-wrap',
@@ -339,12 +353,54 @@ export default function Home() {
                   >
                     {message.content}
                   </div>
+
+                  {!isUser &&
+                    message.sources &&
+                    message.sources.length > 0 && (
+                      <div
+                        style={{
+                          marginTop: '8px',
+                          display: 'flex',
+                          flexWrap: 'wrap',
+                          gap: '7px',
+                        }}
+                      >
+                        {message.sources
+                          .slice(0, 3)
+                          .map((source, sourceIndex) => (
+                            <a
+                              key={`${source}-${sourceIndex}`}
+                              href={source}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              style={{
+                                display: 'inline-block',
+                                padding: '6px 9px',
+                                backgroundColor: '#fff',
+                                color: '#a30d27',
+                                border:
+                                  '1px solid #e4c4ca',
+                                borderRadius: '8px',
+                                fontSize: '11px',
+                                fontWeight: '700',
+                                textDecoration: 'none',
+                                maxWidth: '220px',
+                                overflow: 'hidden',
+                                textOverflow: 'ellipsis',
+                                whiteSpace: 'nowrap',
+                              }}
+                              title={source}
+                            >
+                              ↗ {sourceLabel(source)}
+                            </a>
+                          ))}
+                      </div>
+                    )}
                 </div>
               </div>
             );
           })}
 
-          {/* THINKING MESSAGE */}
           {loading && (
             <div
               style={{
@@ -388,7 +444,6 @@ export default function Home() {
           <div ref={bottomRef} />
         </div>
 
-        {/* INPUT AREA */}
         <div
           style={{
             padding: '20px',
@@ -476,7 +531,6 @@ export default function Home() {
         </div>
       </div>
 
-      {/* FOOTER */}
       <div
         style={{
           marginTop: '12px',
