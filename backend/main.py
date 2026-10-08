@@ -27,10 +27,11 @@ BASE_DIR = Path(__file__).resolve().parent
 CORPUS_PATH = BASE_DIR / "data" / "cliffe_v2_corpus.json.gz"
 
 STOP_WORDS = {
-    "a", "an", "and", "are", "as", "at", "be", "by", "can", "do", "does",
-    "for", "from", "how", "i", "in", "is", "it", "me", "of", "on", "or",
-    "that", "the", "there", "to", "what", "when", "where", "which", "who",
-    "why", "with", "you", "your",
+    "a", "an", "and", "are", "as", "at", "be", "by", "can", "could", "do",
+    "does", "for", "from", "give", "have", "how", "i", "in", "is", "it",
+    "know", "me", "more", "of", "on", "or", "please", "that", "the", "there",
+    "tell", "to", "what", "when", "where", "which", "who", "why", "with",
+    "would", "you", "your", "about",
 }
 
 FOLLOW_UP_WORDS = {
@@ -113,42 +114,31 @@ def build_retrieval_query(
     history: list[ConversationMessage],
 ) -> str:
     """
-    Resolve short conversational follow-ups without making another LLM call.
+    Resolve a short follow-up using ONLY the most recent user topic.
 
-    Example:
-      "Who is Samantha Nan-Callahan?"
-      "Can I have her email?"
-
-    The second retrieval query includes recent useful conversation text, so
-    Pinecone/BM25 still see "Samantha Nan-Callahan".
+    We intentionally do not concatenate the whole conversation. Older topics
+    (for example scholarships) can otherwise overpower a later question such
+    as "can you give me her email?".
     """
     if not history or not is_follow_up(question):
         return question
 
-    useful_messages = []
+    latest_user_message = None
 
-    for message in history[-6:]:
+    for message in reversed(history):
+        if message.role != "user":
+            continue
+
         content = message.content.strip()
 
-        if not content:
-            continue
+        if content:
+            latest_user_message = content
+            break
 
-        # A previous fallback/error should not become retrieval evidence.
-        lowered = content.lower()
-
-        if message.role == "assistant" and (
-            lowered.startswith("i cannot find that info")
-            or lowered.startswith("system error")
-            or lowered.startswith("⚠️")
-        ):
-            continue
-
-        useful_messages.append(content)
-
-    if not useful_messages:
+    if not latest_user_message:
         return question
 
-    return " ".join(useful_messages + [question])
+    return f"{latest_user_message} {question}"
 
 
 def embedding_values(item):
@@ -203,7 +193,7 @@ def initialize_rag():
         if index is not None and gemini_client is not None and bm25 is not None:
             return
 
-        print("🧠 Initializing Cliffe AI V3.1 conversational hybrid RAG...")
+        print("🧠 Initializing Cliffe AI V3.2 conversational hybrid RAG...")
         start = time.time()
 
         pinecone_key = os.getenv("PINECONE_API_KEY")
@@ -252,7 +242,7 @@ def initialize_rag():
             f"   Loaded {len(corpus_rows)} chunks for BM25."
         )
         print(
-            f"✅ Cliffe AI V3.1 ready in "
+            f"✅ Cliffe AI V3.2 ready in "
             f"{time.time() - start:.2f}s"
         )
 
@@ -484,7 +474,9 @@ def build_history_for_prompt(
 
     lines = []
 
-    for message in history[-6:]:
+    # The immediately preceding exchange is enough to resolve "her", "him",
+    # "it", etc. Older topics can distract the model.
+    for message in history[-2:]:
         label = "Student" if message.role == "user" else "Cliffe AI"
         lines.append(f"{label}: {message.content}")
 
@@ -545,17 +537,49 @@ Cliffe website context:
     )
 
 
-def unique_sources(
+def relevant_sources(
     docs: list[dict],
-    limit: int = 5,
+    retrieval_query: str,
+    limit: int = 3,
 ) -> list[str]:
+    """
+    Return source cards that actually match the retrieval topic instead of
+    showing unrelated pages that happened to land lower in the final context.
+    """
+    query_tokens = significant_query_tokens(retrieval_query)
+    scored = []
+
+    for position, doc in enumerate(docs):
+        source = doc.get("source")
+
+        if not source:
+            continue
+
+        if not query_tokens:
+            coverage = 1.0
+        else:
+            doc_tokens = set(tokenize(doc.get("text", "")))
+            overlap = sum(
+                1 for token in query_tokens if token in doc_tokens
+            )
+            coverage = overlap / len(query_tokens)
+
+        scored.append((coverage, position, source))
+
+    # Prefer sources matching at least half of the meaningful query terms.
+    strong = [
+        item for item in scored
+        if item[0] >= 0.5
+    ]
+
+    candidates = strong if strong else scored
+    candidates.sort(key=lambda item: (-item[0], item[1]))
+
     sources = []
     seen = set()
 
-    for doc in docs:
-        source = doc.get("source")
-
-        if source and source not in seen:
+    for _, _, source in candidates:
+        if source not in seen:
             sources.append(source)
             seen.add(source)
 
@@ -580,7 +604,7 @@ def health():
     return {
         "status": "ok",
         "service": "Cliffe AI",
-        "rag_version": "v3.1-conversational-hybrid",
+        "rag_version": "v3.2-conversational-hybrid",
         "index": INDEX_NAME,
         "namespace": NAMESPACE,
         "embedding_model": EMBED_MODEL,
@@ -677,7 +701,10 @@ def ask(q: Query):
 
         return {
             "answer": answer,
-            "sources": unique_sources(docs),
+            "sources": relevant_sources(
+                docs,
+                retrieval_query,
+            ),
             "response_time": round(
                 total_elapsed,
                 2,
